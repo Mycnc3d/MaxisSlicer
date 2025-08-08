@@ -1,0 +1,256 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1111111..2222222 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,5 +1,14 @@
+ cmake_minimum_required(VERSION 3.16)
+ project(OrcaSlicer)
++
++# ===== Multi-axis experimental flag =====
++option(ORCA_ENABLE_MULTIAXIS "Enable experimental multi-axis features" ON)
++if(ORCA_ENABLE_MULTIAXIS)
++    message(STATUS "Multi-axis features: ENABLED (experimental)")
++    add_definitions(-DORCA_ENABLE_MULTIAXIS)
++else()
++    message(STATUS "Multi-axis features: DISABLED")
++endif()
+
+ # ... reste du fichier ...
+
+diff --git a/src/libslic3r/CMakeLists.txt b/src/libslic3r/CMakeLists.txt
+index 3333333..4444444 100644
+--- a/src/libslic3r/CMakeLists.txt
++++ b/src/libslic3r/CMakeLists.txt
+@@ -100,6 +100,18 @@ set(LIBSLIC3R_SOURCES
+     # fichiers existants…
+ )
+
++# ===== Multi-axis module (experimental) =====
++if(ORCA_ENABLE_MULTIAXIS)
++    list(APPEND LIBSLIC3R_SOURCES
++        ${CMAKE_CURRENT_SOURCE_DIR}/MultiAxis/OrienterFollowSurface.cpp
++    )
++    target_sources(libslic3r PRIVATE ${LIBSLIC3R_SOURCES})
++    target_include_directories(libslic3r PUBLIC
++        ${CMAKE_CURRENT_SOURCE_DIR}/MultiAxis
++    )
++endif()
++
++
+ target_compile_features(libslic3r PUBLIC cxx_std_17)
+
+diff --git a/src/libslic3r/MultiAxis/MultiAxisMachine.hpp b/src/libslic3r/MultiAxis/MultiAxisMachine.hpp
+new file mode 100644
+index 0000000..aaaaaaa
+--- /dev/null
++++ b/src/libslic3r/MultiAxis/MultiAxisMachine.hpp
+@@ -0,0 +1,75 @@
++#pragma once
++#ifdef ORCA_ENABLE_MULTIAXIS
++#include <array>
++#include <string>
++
++namespace Slic3r {
++
++enum class AxisType { Linear, Rotary };
++
++struct MultiAxisKinematics {
++    bool has_A{false}, has_B{false}, has_C{false};
++    AxisType axis_A{AxisType::Rotary}, axis_B{AxisType::Rotary}, axis_C{AxisType::Rotary};
++    double min_A{-180.0}, max_A{180.0}, maxfeed_A{3600.0};
++    double min_B{-180.0}, max_B{180.0}, maxfeed_B{3600.0};
++    double min_C{-999999.0}, max_C{999999.0}, maxfeed_C{3600.0};
++    std::array<double,3> tool_dir{0.0,0.0,1.0}; // Z outil
++};
++
++struct MultiAxisMachine {
++    bool enabled{false};
++    std::string kinematics_type{"XYZ+ABC"}; // "XYZ+A", "XYZ+AB", "XYZ+ABC", "XZC (Lathe)"
++    MultiAxisKinematics kin{};
++    bool is_lathe_mode{false};
++};
++
++} // namespace Slic3r
++#endif // ORCA_ENABLE_MULTIAXIS
+diff --git a/src/libslic3r/MultiAxis/Settings.hpp b/src/libslic3r/MultiAxis/Settings.hpp
+new file mode 100644
+index 0000000..bbbbbbb
+--- /dev/null
++++ b/src/libslic3r/MultiAxis/Settings.hpp
+@@ -0,0 +1,86 @@
++#pragma once
++#ifdef ORCA_ENABLE_MULTIAXIS
++#include "MultiAxisMachine.hpp"
++#include <cstdlib>
++#include <cstring>
++
++namespace Slic3r {
++
++// Petit loader de settings depuis des variables d'environnement
++// ORCA_MULTIAXIS=1           -> active le mode multi-axes
++// ORCA_MULTIAXIS_KIN=XYZ+AB  -> type de cinématique
++// ORCA_MULTIAXIS_LATHE=1     -> mode tour XZC
++inline MultiAxisMachine& multi_axis_settings()
++{
++    static MultiAxisMachine s;
++    static bool initialized = false;
++    if (!initialized) {
++        auto get_env = [](const char* k)->const char*{ const char* v = std::getenv(k); return v ? v : ""; };
++        const char* on = get_env("ORCA_MULTIAXIS");
++        s.enabled = (std::strcmp(on, "1") == 0 || std::strcmp(on, "ON") == 0 || std::strcmp(on, "on") == 0);
++        const char* kin = get_env("ORCA_MULTIAXIS_KIN");
++        if (*kin) s.kinematics_type = std::string(kin);
++        const char* lathe = get_env("ORCA_MULTIAXIS_LATHE");
++        s.is_lathe_mode = (std::strcmp(lathe, "1") == 0);
++        // par défaut : XYZ+ABC actif, A/B/C rotatifs
++        s.kin.has_A = s.kin.has_B = s.kin.has_C = true;
++        initialized = true;
++    }
++    return s;
++}
++
++} // namespace Slic3r
++#endif // ORCA_ENABLE_MULTIAXIS
+diff --git a/src/libslic3r/MultiAxis/ToolOrientation.hpp b/src/libslic3r/MultiAxis/ToolOrientation.hpp
+new file mode 100644
+index 0000000..ccccccc
+--- /dev/null
++++ b/src/libslic3r/MultiAxis/ToolOrientation.hpp
+@@ -0,0 +1,56 @@
++#pragma once
++#ifdef ORCA_ENABLE_MULTIAXIS
++#include "Point.hpp"
++#include <optional>
++
++namespace Slic3r {
++
++struct ToolVector { double nx, ny, nz; }; // normalisé
++
++struct ToolOrientationRequest {
++    Vec3d position;     // XYZ (mm)
++    Vec3d surface_norm; // normale estimée
++    bool  allow_tilt{true};
++};
++
++struct ToolOrientationSolution {
++    ToolVector tool_dir;  // direction outil
++    double A{0.0}, B{0.0}, C{0.0}; // angles/positions axes secondaires
++};
++
++class IToolOrienter {
++public:
++    virtual ~IToolOrienter() = default;
++    virtual std::optional<ToolOrientationSolution>
++    solve(const ToolOrientationRequest& req) const = 0;
++};
++
++} // namespace Slic3r
++#endif // ORCA_ENABLE_MULTIAXIS
+diff --git a/src/libslic3r/MultiAxis/ToolOrientationFactory.hpp b/src/libslic3r/MultiAxis/ToolOrientationFactory.hpp
+new file mode 100644
+index 0000000..ddddddd
+--- /dev/null
++++ b/src/libslic3r/MultiAxis/ToolOrientationFactory.hpp
+@@ -0,0 +1,33 @@
++#pragma once
++#ifdef ORCA_ENABLE_MULTIAXIS
++#include "ToolOrientation.hpp"
++#include "Settings.hpp"
++#include <memory>
++
++namespace Slic3r {
++
++class IToolOrienter;
++
++inline std::unique_ptr<IToolOrienter> make_default_orienter();
++
++} // namespace Slic3r
++#endif // ORCA_ENABLE_MULTIAXIS
+diff --git a/src/libslic3r/MultiAxis/OrienterFollowSurface.cpp b/src/libslic3r/MultiAxis/OrienterFollowSurface.cpp
+new file mode 100644
+index 0000000..eeeeeee
+--- /dev/null
++++ b/src/libslic3r/MultiAxis/OrienterFollowSurface.cpp
+@@ -0,0 +1,77 @@
++#ifdef ORCA_ENABLE_MULTIAXIS
++#include "ToolOrientationFactory.hpp"
++#include <cmath>
++#include <memory>
++
++namespace Slic3r {
++
++using std::unique_ptr;
++
++static inline void normal_to_euler_AB(const double nx, const double ny, const double nz, double& A, double& B)
++{
++    // Convention simple (à ajuster selon ta cinématique) :
++    //  - A : rotation autour de X
++    //  - B : rotation autour de Y
++    // On aligne Z outil sur la normale (pitch/roll).
++    const double eps = 1e-9;
++    const double denom = std::sqrt(std::max(eps, ny*ny + nz*nz));
++    B = std::atan2(nx, denom) * 180.0/M_PI;
++    A = -std::atan2(ny, nz) * 180.0/M_PI;
++}
++
++class OrienterFollowSurface final : public IToolOrienter {
++public:
++    std::optional<ToolOrientationSolution>
++    solve(const ToolOrientationRequest& req) const override
++    {
++        const double nx = req.surface_norm.x();
++        const double ny = req.surface_norm.y();
++        const double nz = req.surface_norm.z();
++        const double norm = std::sqrt(nx*nx + ny*ny + nz*nz);
++        if (norm < 1e-8) return std::nullopt;
++        const double nnx = nx / norm;
++        const double nny = ny / norm;
++        const double nnz = nz / norm;
++
++        double A=0.0, B=0.0;
++        normal_to_euler_AB(nnx, nny, nnz, A, B);
++        ToolOrientationSolution out;
++        out.tool_dir = { nnx, nny, nnz };
++        out.A = A; out.B = B; out.C = 0.0;
++        return out;
++    }
++};
++
++unique_ptr<IToolOrienter> make_default_orienter()
++{
++    return unique_ptr<IToolOrienter>(new OrienterFollowSurface());
++}
++
++} // namespace Slic3r
++#endif // ORCA_ENABLE_MULTIAXIS
+diff --git a/README_MULT IAXIS.md b/README_MULT IAXIS.md
+new file mode 100644
+index 0000000..fffffff
+--- /dev/null
++++ b/README_MULT IAXIS.md
+@@ -0,0 +1,41 @@
++# Multi-axis (experimental)
++
++Ce module pose le squelette pour l'impression multi-axes (4/5 axes, tour XZC).
++Pour l'instant, il n'active aucune modification du G-code tant que vous n'en branchez pas les hooks.
++
++## Activer côté build
++```
++cmake -DORCA_ENABLE_MULTIAXIS=ON ...
++```
++
++## Activer à l'exécution (temporaire, via variables d'environnement)
++```
++export ORCA_MULTIAXIS=1
++export ORCA_MULTIAXIS_KIN=XYZ+ABC
++export ORCA_MULTIAXIS_LATHE=0
++```
++
++## À faire ensuite
++- Brancher un hook G-code qui calcule/écrit A/B/C pour chaque segment
++- Ajouter UI (Printer Settings) pour piloter `enabled`, cinématique, limites
++- Implémenter cinématiques réelles (Head-AB, Bed-tilt, Lathe XZC)
++
++## Notes
++- Cible firmware: RepRap (A/B/C en degrés pour axes rotatifs)
++- Garder des vitesses angulaires modestes et des clamps
